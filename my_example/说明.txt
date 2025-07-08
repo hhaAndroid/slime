@@ -1,0 +1,3 @@
+demo_1.py 是用于简单验证 ray 的训推共卡分布式的例子
+demo_2.py 是用于验证同卡情况下的 cuda ipc 通信
+demo_3.py 是用于验证不同卡但是同节点情况下的 cuda ipc 通信
