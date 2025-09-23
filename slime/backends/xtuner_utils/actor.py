@@ -8,7 +8,7 @@ from torch_memory_saver import torch_memory_saver
 from xtuner.v1.config import AdamWConfig, FSDPConfig
 from xtuner.v1.data_proto.sequence_context import SequenceContext
 from xtuner.v1.model import get_model_config_from_hf
-
+import math
 import wandb
 from slime.ray.registry import get_actors
 from slime.ray.train_actor import TrainRayActor
@@ -48,10 +48,10 @@ class XTunerTrainRayActor(TrainRayActor):
 
         self.optim_cfg = AdamWConfig(
             lr=1e-6,
-            betas=(0.9, 0.98),
+            betas=(0.9, 0.999),
             weight_decay=0.1,
             eps=1e-8,
-            foreach=False if args.optimizer_disable_foreach else None,
+            foreach=False,
         )
         self.optimizer = self.optim_cfg.build([p for p in self.model.parameters() if p.requires_grad])
 
@@ -108,6 +108,10 @@ class XTunerTrainRayActor(TrainRayActor):
             torch.where(l.bool(), t, -100).roll(-1) for t, l in zip(rollout_data["tokens"], rollout_data["loss_masks"])
         ]
 
+        raw_rewards = torch.stack(rollout_data["raw_reward"])
+        print(f'mean reward: {raw_rewards.mean().item()}, std reward: {raw_rewards.std().item()}, '
+              f'max_reward: {raw_rewards.max().item()}, min_reward: {raw_rewards.min().item()},'
+              f'length: {raw_rewards.numel()}')
         # pack data
         buffer_size = 0
         pack_infos = [[]]
@@ -171,7 +175,15 @@ class XTunerTrainRayActor(TrainRayActor):
         if self.args.offload:
             self.wake_up(("model"))
 
+        self._optimizer_steps = self.args.train_optimizer_steps
         seq_ctx_list, shifted_labels_list, advantages_list = self.get_rollout_data(rollout_data_ref)
+        num_batches = len(seq_ctx_list)
+        iters_per_step = math.ceil(num_batches / self._optimizer_steps)
+        if num_batches < self._optimizer_steps:
+            print(
+                f"Optimizer only step once because num_batches {num_batches} < optimizer_steps {self._optimizer_steps}."
+            )
+
         masks = [labels != -100 for labels in shifted_labels_list]
 
         global_grad_tokens = sum([mask.sum() for mask in masks])
@@ -227,11 +239,29 @@ class XTunerTrainRayActor(TrainRayActor):
                 )
                 wandb.log(log_dict)
 
-        dp_size = dist.get_world_size() // self.args.sp_size
-        iters_per_step = self.args.global_batch_size // dp_size
+        # dp_size = dist.get_world_size() // self.args.sp_size
+        # iters_per_step = self.args.global_batch_size // dp_size
         num_steps_per_rollout = len(seq_ctx_list) // iters_per_step
 
         for i in range(0, len(seq_ctx_list), iters_per_step):
+            batches_seq_ctx = seq_ctx_list[i: i + iters_per_step]
+            batch_shifted_labels_list = shifted_labels_list[i: i + iters_per_step]
+            batch_advantages_list = advantages_list[i: i + iters_per_step]
+            batch_old_logprobs_list = old_logprobs_list[i: i + iters_per_step]
+            batch_masks = masks[i: i + iters_per_step]
+
+            rank_grad_tokens = sum((labels != -100).sum() for labels in batch_shifted_labels_list)
+            rank_grad_tokens = cast(torch.Tensor, rank_grad_tokens)
+            global_grad_tokens = rank_grad_tokens
+            if dist.is_initialized():
+                dist.all_reduce(global_grad_tokens, op=dist.ReduceOp.SUM)
+
+            if global_grad_tokens == 0:
+                print(
+                    "Global gradient tokens is 0, which may lead to division by zero in loss weight calculation."
+                )
+                global_grad_tokens.add_(1)  # Avoid division by zero
+
             log_dict = train_step(
                 self.args,
                 self.model,
@@ -239,14 +269,14 @@ class XTunerTrainRayActor(TrainRayActor):
                 self.optimizer,
                 data_batches=[
                     {
-                        "seq_ctx": seq_ctx_list[i + j],
-                        "shifted_labels": shifted_labels_list[i + j],
-                        "advantages": advantages_list[i + j],
-                        "old_logprobs": old_logprobs_list[i + j],
-                        "ref_logprobs": ref_logprobs_list[i + j] if self.with_ref else None,
-                        "mask": masks[i + j],
+                        "seq_ctx": batches_seq_ctx[j],
+                        "shifted_labels": batch_shifted_labels_list[j],
+                        "advantages":batch_advantages_list[j],
+                        "old_logprobs": batch_old_logprobs_list[j],
+                        "ref_logprobs": None,
+                        "mask": batch_masks[j],
                     }
-                    for j in range(iters_per_step)
+                    for j in range(len(batches_seq_ctx))
                 ],
                 global_grad_tokens=global_grad_tokens,
             )

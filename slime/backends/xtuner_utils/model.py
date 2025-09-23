@@ -8,6 +8,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 from torch.utils._foreach_utils import _device_has_foreach_support, _has_foreach_support
 from xtuner.v1.module.router import NoAuxRouterConfig
+from torch.distributed.nn.functional import all_reduce
 
 from slime.utils.ppo_utils import compute_approx_kl, compute_policy_loss
 
@@ -94,7 +95,10 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
         del output
 
         # we already divide by the global token, need to remove the mean in fsdp gradient allreduce.
-        loss = loss * dist.get_world_size()
+        # loss = loss * dist.get_world_size()
+        if dist.is_initialized():
+            loss = all_reduce(loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+
         loss.backward()
 
     if moe_need_update_bias:
@@ -107,6 +111,7 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
     grad_norm = clip_grad_norm(model, args.clip_grad)
 
     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+        print("grad norm is nan or inf, skip this step")
         optimizer.zero_grad()
     else:
         optimizer.step()
