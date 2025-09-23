@@ -4,7 +4,7 @@ import random
 import time
 from pathlib import Path
 from typing import List, Union
-
+import json
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -108,6 +108,24 @@ class RolloutManager:
         return data
 
     def _save_debug_rollout_data(self, data):
+        save_path = f'dump_data/rollout_id_{self.rollout_id}_data.jsonl'
+
+        with open(save_path, 'w', encoding='utf-8') as f:
+            for _data in data:
+                samples = _data.to_dict()
+                item = {
+                    "rollout_id": self.rollout_id,
+                    "index": samples['index'],
+                    "prompt": samples['prompt'],
+                    "response": samples['response'],
+                    "response_length": samples['response_length'],
+                    "label": samples['label'],
+                    "reward": samples['reward']['score'],
+                    "acc": int(samples['reward']['acc']),
+                }
+                json.dump(item, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
         # TODO to be refactored (originally Buffer._set_data)
         if (path_template := self.args.save_debug_rollout_data) is not None:
             path = Path(path_template.format(rollout_id=self.rollout_id))

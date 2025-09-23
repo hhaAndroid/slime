@@ -278,6 +278,10 @@ def compute_score(
     # Limit solution length for efficiency
     solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
 
+    eos_token = '<|endoftext|>'
+    if solution_str.endswith(eos_token):
+        solution_str = solution_str[: -len(eos_token)]
+
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
 

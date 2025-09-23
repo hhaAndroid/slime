@@ -108,7 +108,7 @@ class XTunerTrainRayActor(TrainRayActor):
             torch.where(l.bool(), t, -100).roll(-1) for t, l in zip(rollout_data["tokens"], rollout_data["loss_masks"])
         ]
 
-        raw_rewards = torch.stack(rollout_data["raw_reward"])
+        raw_rewards = torch.tensor(rollout_data["raw_reward"])
         print(f'mean reward: {raw_rewards.mean().item()}, std reward: {raw_rewards.std().item()}, '
               f'max_reward: {raw_rewards.max().item()}, min_reward: {raw_rewards.min().item()},'
               f'length: {raw_rewards.numel()}')
