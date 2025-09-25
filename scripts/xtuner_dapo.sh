@@ -8,7 +8,7 @@ ray stop --force
 set -ex
 
 # will prevent ray from buffering stdout/stderr
-export PYTHONBUFFERED=16
+# export PYTHONBUFFERED=1
 
 CKPT_ARGS=(
    --hf-checkpoint /mnt/shared-storage-user/llmrazor-share/model/Qwen2.5-Math-7B
@@ -24,15 +24,14 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --eval-reward-key acc
-   --num-rollout 200
+   --num-rollout 100
    --rollout-batch-size 512
    --n-samples-per-prompt 16
    --rollout-max-response-len 8192
    --rollout-temperature 1.0
-   --balance-data
-
+   --use-dynamic-batch-size
    --global-batch-size 8192
-   --max-tokens-per-gpu 32768
+   --max-tokens-per-gpu 16384
 )
 
 EVAL_ARGS=(
@@ -77,7 +76,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    --actor-num-gpus-per-node 4 \
    --rollout-num-gpus 4 \
    --train-optimizer-steps 16 \
-   --pack-max-length 32768 \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${WANDB_ARGS[@]} \

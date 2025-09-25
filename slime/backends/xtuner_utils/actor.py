@@ -1,6 +1,6 @@
 from contextlib import nullcontext
 from typing import cast
-
+import copy
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -19,6 +19,19 @@ from slime.utils.wandb_utils import init_wandb_secondary
 
 from .model import gather_logprobs, train_step
 from .update_weight_utils import UpdateWeightFromDistributed
+import time
+from contextlib import contextmanager
+
+
+@contextmanager
+def profile_time_and_memory(desc):
+    start_t = time.time()
+
+    yield
+
+    cost_time = time.time() - start_t
+
+    print(f"{desc} Elapsed time {cost_time:.2f}")
 
 
 class XTunerTrainRayActor(TrainRayActor):
@@ -108,59 +121,64 @@ class XTunerTrainRayActor(TrainRayActor):
             torch.where(l.bool(), t, -100).roll(-1) for t, l in zip(rollout_data["tokens"], rollout_data["loss_masks"])
         ]
 
-        raw_rewards = torch.tensor(rollout_data["raw_reward"])
-        print(f'mean reward: {raw_rewards.mean().item()}, std reward: {raw_rewards.std().item()}, '
-              f'max_reward: {raw_rewards.max().item()}, min_reward: {raw_rewards.min().item()},'
-              f'length: {raw_rewards.numel()}')
-        # pack data
-        buffer_size = 0
-        pack_infos = [[]]
-        for i, tokens in enumerate(rollout_data["tokens"]):
-            num_token = tokens.numel()
-            if num_token + buffer_size > self.args.max_tokens_per_gpu and len(pack_infos[-1]) > 0:
-                pack_infos.append([i])
-                buffer_size = 0
+        if dist.get_rank() == 0:
+            raw_rewards = torch.tensor(rollout_data["raw_reward"])
+            print(f'mean reward: {raw_rewards.mean().item()}, std reward: {raw_rewards.std().item()}, '
+                  f'max_reward: {raw_rewards.max().item()}, min_reward: {raw_rewards.min().item()},'
+                  f'length: {raw_rewards.numel()}')
 
-            pack_infos[-1].append(i)
-            buffer_size += num_token
+        with profile_time_and_memory('[Packing data]'):
+            # pack data
+            buffer_size = 0
+            pack_infos = [[]]
+            for i, tokens in enumerate(rollout_data["tokens"]):
+                num_token = tokens.numel()
+                if num_token + buffer_size > self.args.max_tokens_per_gpu and len(pack_infos[-1]) > 0:
+                    pack_infos.append([i])
+                    buffer_size = 0
 
-        seq_ctx_list = []
-        shifted_labels_list = []
-        advantages_list = []
-        for indices in pack_infos:
-            seq_ctx = [rollout_data["tokens"][i] for i in indices]
-            total_len = sum([t.numel() for t in seq_ctx])
-            pad_len = self.args.max_tokens_per_gpu - total_len
-            label = [rollout_data["shifted_labels"][i] for i in indices]
-            advantages = [rollout_data["rewards"][i] for i in indices]
-            if pad_len > 0:
-                pad_labels = torch.full(
-                    (1, pad_len),
-                    -100,
-                    dtype=rollout_data["shifted_labels"][0].dtype,
-                    device=torch.cuda.current_device(),
-                )
-                seq_ctx.append(
-                    torch.zeros(1, pad_len, dtype=rollout_data["tokens"][0].dtype, device=torch.cuda.current_device())
-                )
-                label.append(pad_labels)
-                advantages.append(0.0)
+                pack_infos[-1].append(i)
+                buffer_size += num_token
 
-            seq_ctx = SequenceContext.from_input_ids(seq_ctx)
-            seq_ctx.num_padding = pad_len
-            shifted_labels = torch.cat(label, dim=1)
-            advantages = torch.tensor(advantages, device=torch.cuda.current_device()).float().unsqueeze(0)
-            cu_seq_lens_q = seq_ctx.cu_seq_lens_q
-            num_tokens = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
-            advantages = torch.repeat_interleave(advantages, num_tokens, dim=1)
+        with profile_time_and_memory('[To Seq]'):
+            seq_ctx_list = []
+            shifted_labels_list = []
+            advantages_list = []
+            for indices in pack_infos:
+                seq_ctx = [rollout_data["tokens"][i] for i in indices]
+                total_len = sum([t.numel() for t in seq_ctx])
+                pad_len = self.args.max_tokens_per_gpu - total_len
+                label = [rollout_data["shifted_labels"][i] for i in indices]
+                advantages = [rollout_data["rewards"][i] for i in indices]
+                if pad_len > 0:
+                    pad_labels = torch.full(
+                        (1, pad_len),
+                        -100,
+                        dtype=rollout_data["shifted_labels"][0].dtype,
+                        device=torch.cuda.current_device(),
+                    )
+                    seq_ctx.append(
+                        torch.zeros(1, pad_len, dtype=rollout_data["tokens"][0].dtype,
+                                    device=torch.cuda.current_device())
+                    )
+                    label.append(pad_labels)
+                    advantages.append(0.0)
 
-            seq_ctx_list.append(seq_ctx)
-            shifted_labels_list.append(shifted_labels)
-            advantages_list.append(advantages)
+                seq_ctx = SequenceContext.from_input_ids(seq_ctx)
+                seq_ctx.num_padding = pad_len
+                shifted_labels = torch.cat(label, dim=1)
+                advantages = torch.tensor(advantages, device=torch.cuda.current_device()).float().unsqueeze(0)
+                cu_seq_lens_q = seq_ctx.cu_seq_lens_q
+                num_tokens = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
+                advantages = torch.repeat_interleave(advantages, num_tokens, dim=1)
+
+                seq_ctx_list.append(seq_ctx)
+                shifted_labels_list.append(shifted_labels)
+                advantages_list.append(advantages)
         return seq_ctx_list, shifted_labels_list, advantages_list
 
     def compute_logprobs(
-        self, model, seq_ctx_list: list[SequenceContext], shifted_labels_list: list[torch.Tensor]
+            self, model, seq_ctx_list: list[SequenceContext], shifted_labels_list: list[torch.Tensor]
     ) -> list[torch.Tensor]:
         logprobs_list = []
         with torch.no_grad():
@@ -178,12 +196,30 @@ class XTunerTrainRayActor(TrainRayActor):
         self._optimizer_steps = self.args.train_optimizer_steps
         seq_ctx_list, shifted_labels_list, advantages_list = self.get_rollout_data(rollout_data_ref)
         num_batches = len(seq_ctx_list)
+
+        # all reduce 计算最大的 num_batches
+        num_batches_tensor = torch.tensor(num_batches, device=torch.cuda.current_device())
+        dist.all_reduce(num_batches_tensor, op=dist.ReduceOp.MAX)
+
+        # 不够的补充到一样长度
+        max_num_batches = num_batches_tensor.item()
+        pad_len = max_num_batches - num_batches
+        if pad_len > 0:
+            print(f'[{dist.get_rank()}]PadLen {pad_len}')
+            copy_seq_ctx = copy.deepcopy(seq_ctx_list[-1])
+            copy_seq_ctx.num_padding = self.args.max_tokens_per_gpu
+            for _ in range(pad_len):
+                seq_ctx_list.append(copy_seq_ctx)
+                shifted_labels_list.append(torch.ones_like(shifted_labels_list[-1]) * -100)
+                advantages_list.append(torch.zeros_like(advantages_list[-1]))
+
+        num_batches = len(seq_ctx_list)
         iters_per_step = math.ceil(num_batches / self._optimizer_steps)
         if num_batches < self._optimizer_steps:
             print(
                 f"Optimizer only step once because num_batches {num_batches} < optimizer_steps {self._optimizer_steps}."
             )
-
+        print(f'[{dist.get_rank()}]Rollout {rollout_id}: num batches: {num_batches}, iters per step: {iters_per_step}')
         masks = [labels != -100 for labels in shifted_labels_list]
 
         global_grad_tokens = sum([mask.sum() for mask in masks])
@@ -191,7 +227,8 @@ class XTunerTrainRayActor(TrainRayActor):
         global_grad_tokens = global_grad_tokens.clamp_min(1)
 
         # old logprobs are inplaced updated in compute_actor_logprobs
-        old_logprobs_list = self.compute_logprobs(self.model, seq_ctx_list, shifted_labels_list)
+        with profile_time_and_memory(f'[{dist.get_rank()}][Calc Logprobs]'):
+            old_logprobs_list = self.compute_logprobs(self.model, seq_ctx_list, shifted_labels_list)
 
         if self.with_ref:
             self.ref_model.to_device(torch.cuda.current_device())
@@ -201,8 +238,8 @@ class XTunerTrainRayActor(TrainRayActor):
             kl_div_sum: torch.Tensor | None = None
             for old_logprobs, ref_logprobs, mask in zip(old_logprobs_list, ref_logprobs_list, masks):
                 kl_div = (
-                    compute_approx_kl(old_logprobs, ref_logprobs, loss_weights=mask, kl_loss_type="low_var_kl")
-                    * (mask.to(old_logprobs.dtype))
+                        compute_approx_kl(old_logprobs, ref_logprobs, loss_weights=mask, kl_loss_type="low_var_kl")
+                        * (mask.to(old_logprobs.dtype))
                 ).sum()
 
                 kl_div_sum = kl_div if kl_div_sum is None else kl_div_sum + kl_div
@@ -213,12 +250,15 @@ class XTunerTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 print(f"Rollout {rollout_id}: avg KL divergence: {avg_kl_div}")
 
-        # log
-        # TODO: extract this
-        log_dict = {}
-        sum_old_logprobs = sum([-(old_logprobs * mask).sum() for old_logprobs, mask in zip(old_logprobs_list, masks)])
-        dist.all_reduce(sum_old_logprobs, op=dist.ReduceOp.SUM)
-        log_dict["rollout/log_probs"] = (sum_old_logprobs / global_grad_tokens).item()
+        with profile_time_and_memory(f'[{dist.get_rank()}[reduce log_probs]'):
+            # log
+            # TODO: extract this
+            log_dict = {}
+            print(len(old_logprobs_list), len(masks))
+            sum_old_logprobs = sum(
+                [-(old_logprobs * mask).sum() for old_logprobs, mask in zip(old_logprobs_list, masks)])
+            dist.all_reduce(sum_old_logprobs, op=dist.ReduceOp.SUM)
+            log_dict["rollout/log_probs"] = (sum_old_logprobs / global_grad_tokens).item()
         if self.with_ref:
             sum_ref_logprobs = sum(
                 [-(old_logprobs * mask).sum() for old_logprobs, mask in zip(old_logprobs_list, masks)]
@@ -233,9 +273,9 @@ class XTunerTrainRayActor(TrainRayActor):
                     rollout_id
                     if not self.args.wandb_always_use_train_step
                     else rollout_id
-                    * self.args.rollout_batch_size
-                    * self.args.n_samples_per_prompt
-                    // self.args.global_batch_size
+                         * self.args.rollout_batch_size
+                         * self.args.n_samples_per_prompt
+                         // self.args.global_batch_size
                 )
                 wandb.log(log_dict)
 
@@ -243,7 +283,8 @@ class XTunerTrainRayActor(TrainRayActor):
         # iters_per_step = self.args.global_batch_size // dp_size
         num_steps_per_rollout = len(seq_ctx_list) // iters_per_step
 
-        print(f'grad accumulation steps: {iters_per_step}, num steps per rollout: {num_steps_per_rollout}')
+        if dist.get_rank() == 0:
+            print(f'grad accumulation steps: {iters_per_step}, num steps per rollout: {num_steps_per_rollout}')
         for i in range(0, len(seq_ctx_list), iters_per_step):
             batches_seq_ctx = seq_ctx_list[i: i + iters_per_step]
             batch_shifted_labels_list = shifted_labels_list[i: i + iters_per_step]
@@ -272,7 +313,7 @@ class XTunerTrainRayActor(TrainRayActor):
                     {
                         "seq_ctx": batches_seq_ctx[j],
                         "shifted_labels": batch_shifted_labels_list[j],
-                        "advantages":batch_advantages_list[j],
+                        "advantages": batch_advantages_list[j],
                         "old_logprobs": batch_old_logprobs_list[j],
                         "ref_logprobs": None,
                         "mask": batch_masks[j],
@@ -281,7 +322,7 @@ class XTunerTrainRayActor(TrainRayActor):
                 ],
                 global_grad_tokens=global_grad_tokens,
             )
-            print(f"[{dist.get_rank()}]Rollout 1 Step {i*iters_per_step}: {log_dict}")
+            print(f"[{dist.get_rank()}]Rollout 1 Step {i}: {log_dict}")
             if dist.get_rank() == 0:
                 if self.args.use_wandb:
                     log_dict["train/step"] = rollout_id * num_steps_per_rollout + i // iters_per_step

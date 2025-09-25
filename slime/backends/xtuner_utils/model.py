@@ -15,8 +15,8 @@ from slime.utils.ppo_utils import compute_approx_kl, compute_policy_loss
 
 def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], global_grad_tokens):
     moe_need_update_bias = (
-        isinstance(getattr(model_cfg, "router", None), NoAuxRouterConfig)
-        and model_cfg.router.router_bias_update_speed > 0
+            isinstance(getattr(model_cfg, "router", None), NoAuxRouterConfig)
+            and model_cfg.router.router_bias_update_speed > 0
     )
 
     if moe_need_update_bias:
@@ -40,12 +40,15 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
             loss_dict[key] += val
 
     max_ratios = []
-    for data_batch in data_batches:
+    for i, data_batch in enumerate(data_batches):
         seq_ctx = data_batch["seq_ctx"]
         shifted_labels = data_batch["shifted_labels"]
         old_logprobs = data_batch["old_logprobs"]
         advantages = data_batch["advantages"]
         mask = data_batch["mask"]
+
+        if i == 0:
+            print(f'[{dist.get_rank()}]forward shape: {shifted_labels.shape}')
 
         # TODO: check what xtuner does with intra_layer_micro_batch > 1
         output = model(seq_ctx=seq_ctx, loss_ctx=None)
@@ -55,7 +58,7 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
         logprobs = gather_logprobs(logits, shifted_labels)
         ppo_kl = logprobs - old_logprobs
 
-        ratio = torch.exp(ppo_kl)
+        ratio = torch.exp(ppo_kl) * mask
         max_ratio = ratio.max()
         max_ratios.append(max_ratio.item())
 
@@ -178,7 +181,7 @@ def cal_total_norm(tensors: List[DTensor], foreach: Optional[bool] = None):
     device = tensors[0].device
     norms: Tuple[DTensor, ...]
     if (foreach is None and _has_foreach_support(tensors, device)) or (  # type: ignore
-        foreach and _device_has_foreach_support(device)
+            foreach and _device_has_foreach_support(device)
     ):
         norms = torch._foreach_norm(tensors, 2)  # type: ignore
     elif foreach:
@@ -187,7 +190,7 @@ def cal_total_norm(tensors: List[DTensor], foreach: Optional[bool] = None):
         norms = tuple(torch.linalg.vector_norm(g, 2) for g in tensors)
 
     local_norm = torch.linalg.vector_norm(torch.stack([norm.to_local() for norm in norms]), 2, dtype=torch.float32)
-    local_norm_squared = local_norm**2
+    local_norm_squared = local_norm ** 2
     for i, placement in enumerate(placements):
         if isinstance(placement, Shard):
             # When using ep + fsdp, the placement corresponding to fsdp mesh is _StridedShard
@@ -197,7 +200,7 @@ def cal_total_norm(tensors: List[DTensor], foreach: Optional[bool] = None):
             pass
         else:
             raise ValueError(f"Unsupported placement type {placement} in clip_grad_norm")
-    global_norm = local_norm_squared**0.5
+    global_norm = local_norm_squared ** 0.5
     return global_norm
 
 
