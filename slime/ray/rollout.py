@@ -110,7 +110,30 @@ class RolloutManager:
     def _save_debug_rollout_data(self, data):
         save_path = f'dump_data/rollout_id_{self.rollout_id}_data.jsonl'
 
+        rewards = []
+        response_len_list = []
+        for _data in data:
+            samples = _data.to_dict()
+            rewards.append(samples['reward']['score'])
+            response_len_list.append(samples['response_length'])
+
+        rewards = torch.tensor(rewards).float()
+        response_lens = torch.tensor(response_len_list).float()
+
         with open(save_path, 'w', encoding='utf-8') as f:
+            item = {
+                "reward_mean": rewards.mean().item(),
+                "reward_std": rewards.std().item(),
+                "reward_max": rewards.max().item(),
+                "reward_min": rewards.min().item(),
+                "response_len_mean": response_lens.mean().item(),
+                "response_len_std": response_lens.std().item(),
+                "response_len_max": response_lens.max().item(),
+                "response_len_min": response_lens.min().item(),
+                "total_len": len(rewards),
+            }
+            json.dump(item, f, ensure_ascii=False, indent=2)
+            f.write("\n")
             for _data in data:
                 samples = _data.to_dict()
                 item = {

@@ -79,7 +79,7 @@ class Dataset:
             self.origin_samples.append(
                 Sample(
                     prompt=prompt,
-                    label=data[label_key] if label_key is not None else None,
+                    label=str(int(data[label_key])) if label_key is not None else None,
                     metadata=data.get(metadata_key) or {},
                 )
             )
@@ -133,6 +133,21 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
 
     # save the unprocessed reward for logging
     rollout_data["raw_reward"] = data["raw_reward"]
+
+    rewards_list = data['rewards']
+    response_len_list = data['response_lengths']
+    info_dict = {
+        "batch_size": len(rewards_list),
+        "rewards/mean": np.mean(rewards_list),
+        "rewards/min": np.min(rewards_list),
+        "rewards/max": np.max(rewards_list),
+        "response_len/mean": np.mean(response_len_list),
+        "response_len/min": np.min(response_len_list),
+        "response_len/max": np.max(response_len_list),
+        "response_len/std": np.std(response_len_list),
+    }
+    if rank == 0:
+        print(f"Rollout info: {info_dict}")
 
     if "prompt" in data:
         rollout_data["prompt"] = data["prompt"]

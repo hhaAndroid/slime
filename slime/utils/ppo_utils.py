@@ -53,7 +53,12 @@ def compute_policy_loss(
     eps_clip_high: float,
     eps_clip_c: Optional[float] = None,
 ):
-    ratio = (-ppo_kl).exp()
+    eps_clip_c = 10.0
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(ppo_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    # ratio = (-ppo_kl).exp()
+
     pg_losses1 = -ratio * advantages
     pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)

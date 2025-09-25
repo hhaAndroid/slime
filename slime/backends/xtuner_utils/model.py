@@ -39,6 +39,7 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
         else:
             loss_dict[key] += val
 
+    max_ratios = []
     for data_batch in data_batches:
         seq_ctx = data_batch["seq_ctx"]
         shifted_labels = data_batch["shifted_labels"]
@@ -53,6 +54,10 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
         logits = output["logits"]
         logprobs = gather_logprobs(logits, shifted_labels)
         ppo_kl = logprobs - old_logprobs
+
+        ratio = torch.exp(ppo_kl)
+        max_ratio = ratio.max()
+        max_ratios.append(max_ratio.item())
 
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
         pg_clipfrac = (pg_clipfrac * mask).sum() / global_grad_tokens
@@ -125,6 +130,7 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
     if moe_need_update_bias:
         loss_dict["maxvio"] = maxvio.item()
 
+    loss_dict["train/max_ratio"] = max_ratios
     return loss_dict
 
 

@@ -243,6 +243,7 @@ class XTunerTrainRayActor(TrainRayActor):
         # iters_per_step = self.args.global_batch_size // dp_size
         num_steps_per_rollout = len(seq_ctx_list) // iters_per_step
 
+        print(f'grad accumulation steps: {iters_per_step}, num steps per rollout: {num_steps_per_rollout}')
         for i in range(0, len(seq_ctx_list), iters_per_step):
             batches_seq_ctx = seq_ctx_list[i: i + iters_per_step]
             batch_shifted_labels_list = shifted_labels_list[i: i + iters_per_step]
@@ -280,8 +281,8 @@ class XTunerTrainRayActor(TrainRayActor):
                 ],
                 global_grad_tokens=global_grad_tokens,
             )
+            print(f"[{dist.get_rank()}]Rollout 1 Step {i*iters_per_step}: {log_dict}")
             if dist.get_rank() == 0:
-                print(f"step {rollout_id * num_steps_per_rollout + i}: {log_dict}")
                 if self.args.use_wandb:
                     log_dict["train/step"] = rollout_id * num_steps_per_rollout + i // iters_per_step
                     wandb.log(log_dict)
