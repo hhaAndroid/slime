@@ -16,7 +16,7 @@
 import re
 import signal
 from typing import Optional
-
+from transformers import AutoTokenizer
 
 def last_boxed_only_string(string: str) -> Optional[str]:
     """Extract the last LaTeX boxed expression from a string.
@@ -257,6 +257,8 @@ def verify(
     correct, pred = is_correct_minerva(solution_str, answer)
     return correct, pred
 
+tokenizer=None
+
 
 def compute_score(
     solution_str: str,
@@ -276,6 +278,7 @@ def compute_score(
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
     # Limit solution length for efficiency
+    old_solution_str = solution_str
     solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
 
     eos_token = '<|endoftext|>'
@@ -287,6 +290,20 @@ def compute_score(
 
     reward = 1.0 if correct else -1.0
     acc = correct
+
+    global tokenizer
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained("/mnt/shared-storage-user/llmrazor-share/model/Qwen2.5-Math-7B")
+
+    expected_len = 4096
+    overlong_buffer_len = 4096
+    valid_response_length = len(
+        tokenizer(old_solution_str, return_tensors="pt")["input_ids"].flatten().tolist()
+    )
+    exceed_len = valid_response_length - expected_len
+    overlong_penalty_factor = 1.0
+    overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+    reward += overlong_reward
 
     return {
         "score": reward,
