@@ -62,7 +62,7 @@ def train_step(args, model, model_cfg, optimizer, data_batches: list[dict], glob
         max_ratio = ratio.max()
         max_ratios.append(max_ratio.item())
 
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, 0.2, 0.28)
         pg_clipfrac = (pg_clipfrac * mask).sum() / global_grad_tokens
         pg_loss = (pg_loss * mask).sum() / global_grad_tokens
         loss = pg_loss

@@ -21,6 +21,8 @@ from .model import gather_logprobs, train_step
 from .update_weight_utils import UpdateWeightFromDistributed
 import time
 from contextlib import contextmanager
+import random
+import numpy as np
 
 
 @contextmanager
@@ -32,6 +34,78 @@ def profile_time_and_memory(desc):
     cost_time = time.time() - start_t
 
     print(f"{desc} Elapsed time {cost_time:.2f}")
+
+
+def closest_sum_indices(buffer, value):
+    buffer = np.array(buffer)
+    sorted_indices = np.argsort(buffer)
+    closest_sum = 0
+    closest_indices = []
+
+    for idx in sorted_indices:
+        closest_sum += buffer[idx]
+        if closest_sum <= value:
+            closest_indices.append(int(idx))
+        if closest_sum >= value:
+            break
+
+    return closest_indices
+
+
+def get_pack_index(num_tokens, target=16384,
+                   flash_attn_block_size=128,
+                   pack_len_type='total_block',
+                   pack_extra_buffer_size=100):
+    inds = [i for i in range(len(num_tokens))]
+    random.shuffle(inds)
+
+    item_buffer = []
+    length_buffer = []
+    longest = 0
+    num_patch = 0
+    pack_infos = []
+    while len(inds) > 0:
+        shfl_i = inds.pop()
+        if num_tokens[shfl_i] + sum(length_buffer) <= target:
+            item_buffer.append(shfl_i)
+            length_buffer.append(num_tokens[shfl_i])
+            num_patch += (num_tokens[shfl_i] // flash_attn_block_size) ** 2 // 2
+            longest = max(longest, num_tokens[shfl_i])
+        else:
+            if len(item_buffer) > 0:
+                if sum(length_buffer) == target:
+                    pack_infos.append(item_buffer)
+                else:
+                    if pack_extra_buffer_size > 0:
+                        # Try to find the most suitable.
+                        buffer_index = inds[-pack_extra_buffer_size:]
+                        buffer = num_tokens[buffer_index]
+                        closest_indices = closest_sum_indices(buffer, target - sum(length_buffer))
+                        indices_to_remove = []
+                        for closest_inds in closest_indices:
+                            indices_to_remove.append(closest_inds + len(inds) - len(buffer_index))
+                            item_buffer.append(buffer_index[closest_inds])
+                            length_buffer.append(num_tokens[buffer_index[closest_inds]])
+                            num_patch += (num_tokens[
+                                              buffer_index[closest_inds]] // flash_attn_block_size) ** 2 // 2
+                            longest = max(longest, num_tokens[buffer_index[closest_inds]])
+                        indices_to_remove = sorted(indices_to_remove, reverse=True)
+                        for index in indices_to_remove:
+                            inds.pop(index)
+                    pack_infos.append(item_buffer)
+            item_buffer = [shfl_i]
+            length_buffer = [num_tokens[shfl_i]]
+            longest = num_tokens[shfl_i]
+            num_patch = (num_tokens[shfl_i] // flash_attn_block_size) ** 2 // 2
+            if int(longest) > target:
+                raise ValueError(f"Single sequence length {longest} exceeds target {target}.")
+    if len(item_buffer) > 0:
+        pack_infos.append(item_buffer)
+    total_index = []
+    for infos in pack_infos:
+        total_index.extend(infos)
+    assert len(num_tokens) == len(total_index) == len(set(total_index))
+    return pack_infos
 
 
 class XTunerTrainRayActor(TrainRayActor):
@@ -109,7 +183,7 @@ class XTunerTrainRayActor(TrainRayActor):
         # loss masks is for logprobs, so it should start from prompt_len - 1
         rollout_data["loss_masks"] = [
             torch.tensor(
-                [0] * (len(t) - len(l) - 1) + l + [0], dtype=torch.int, device=torch.cuda.current_device()
+                [0] * (len(t) - len(l)) + l, dtype=torch.int, device=torch.cuda.current_device()  # eos 应该要学习，所以这个地方应该要改
             ).unsqueeze(0)
             for t, l in zip(rollout_data["tokens"], rollout_data["loss_masks"])
         ]
@@ -127,18 +201,10 @@ class XTunerTrainRayActor(TrainRayActor):
                   f'max_reward: {raw_rewards.max().item()}, min_reward: {raw_rewards.min().item()},'
                   f'length: {raw_rewards.numel()}')
 
-        with profile_time_and_memory('[Packing data]'):
-            # pack data
-            buffer_size = 0
-            pack_infos = [[]]
-            for i, tokens in enumerate(rollout_data["tokens"]):
-                num_token = tokens.numel()
-                if num_token + buffer_size > self.args.max_tokens_per_gpu and len(pack_infos[-1]) > 0:
-                    pack_infos.append([i])
-                    buffer_size = 0
-
-                pack_infos[-1].append(i)
-                buffer_size += num_token
+        pack_infos = get_pack_index(
+            torch.tensor([t.numel() for t in rollout_data["tokens"]]),
+            target=self.args.max_tokens_per_gpu
+        )
 
         with profile_time_and_memory('[To Seq]'):
             seq_ctx_list = []
@@ -150,6 +216,7 @@ class XTunerTrainRayActor(TrainRayActor):
                 pad_len = self.args.max_tokens_per_gpu - total_len
                 label = [rollout_data["shifted_labels"][i] for i in indices]
                 advantages = [rollout_data["rewards"][i] for i in indices]
+                assert pad_len >= 0
                 if pad_len > 0:
                     pad_labels = torch.full(
                         (1, pad_len),
@@ -322,7 +389,7 @@ class XTunerTrainRayActor(TrainRayActor):
                 ],
                 global_grad_tokens=global_grad_tokens,
             )
-            print(f"[{dist.get_rank()}]Rollout 1 Step {i}: {log_dict}")
+            print(f"[{dist.get_rank()}]Rollout {rollout_id} Step {i}: {log_dict}")
             if dist.get_rank() == 0:
                 if self.args.use_wandb:
                     log_dict["train/step"] = rollout_id * num_steps_per_rollout + i // iters_per_step
