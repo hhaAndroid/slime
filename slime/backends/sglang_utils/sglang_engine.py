@@ -189,6 +189,7 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        logger.info(f"==================\nserver_args_dict: {server_args_dict}")
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.worker_type == "encoder":

@@ -1,0 +1,48 @@
+https://www.notion.so/jiajunli-guapisolo/Power-Up-Speculative-Decoding-In-Reinforcement-Learning-2a92d24a293b802d9c73dbae429e581e
+
+
+source /root/slime/scripts/models/mimo-7B-rl.sh
+PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /mnt/shared-storage-user/llmrazor-share/model/MiMo-7B-RL \
+    --save /root/MiMo-7B-RL_torch_dist
+
+
+镜像里面默认是 transformers 4.57.1。如果要跑 qwen3.5 必须升级, 否则下面报错
+
+source /mnt/shared-storage-user/huanghaian/code/slime_package/slime/scripts/models/qwen3.5-35B-A3B.sh
+python tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /mnt/shared-storage-user/llmit/user/maningsheng/data/models/models--Qwen--Qwen3.5-35B-A3B \
+    --save /mnt/shared-storage-user/llmrazor-share/model/Qwen3.5-35B-A3B_torch_dist
+
+torchrun --nproc_per_node 8 tools/convert_hf_to_torch_dist.py \
+    ${MODEL_ARGS[@]} \
+    --hf-checkpoint /mnt/shared-storage-user/llmit/user/maningsheng/data/models/models--Qwen--Qwen3.5-35B-A3B \
+    --save /mnt/shared-storage-user/llmrazor-share/model/Qwen3.5-35B-A3B_torch_dist
+
+
+有点慢，可以考虑用 torchrun 跑
+
+
+--debug-rollout-only
+--save-debug-rollout-data ./debug/data_{rollout_id}.pt
+
+
+--debug-train-only
+--load-debug-rollout-data ./debug/data_{rollout_id}.pt
+
+
+slime 安装 megatron 时候采用的方式是 pip install -e ., 因为 megatron pyproject.toml 内部只能按照 core 模块。其余模块都是不会安装的。
+因为在训练时候还会指定 pythonpath。虽然运行没有问题，但是在 vscode 里面，因为 pyproject 用了 pep517 协议导致 pylance 不认识，也就是无法跳转。
+
+最简单解决办法是：不再采用 -e 安装，而是直接安装，这样也只能安装 core 模块，有部分模块还是无法跳转。因此最终解决办法是
+修改  megatron pyproject.toml：
+
+[tool.setuptools.packages.find]
+include = ["megatron.core", "megatron.core.*", "megatron.training", "megatron.training.*", "megatron.legacy", "megatron.legacy.*","megatron.post_training", "megatron.post_training.*","megatron.rl", "megatron.rl.*"]
+
+然后安装时候就全部会安装。这样跳转功能就正常了，也不用指定 pythonpath。
+
+import debugpy
+debugpy.connect(('10.102.151.17', 5680))

@@ -324,6 +324,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 config = model.module.config
                 num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
                 offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+                print(f"vp_stage: {vp_stage}, offset: {offset}, num_layers_to_build: {num_layers_to_build}")
+                print(f"rollout_routed_experts.shape: {rollout_routed_experts.shape}")
+                print(f"RoutingReplay.all_routing_replays: {len(RoutingReplay.all_routing_replays)}")
                 for layer_id in range(offset, offset + num_layers_to_build):
                     # skip dense layer
                     if isinstance(config.moe_layer_freq, int):
@@ -336,7 +339,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     layer_routed_experts = rollout_routed_experts[:, layer_id]
                     RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
                     routing_replay_offset += 1
-            assert routing_replay_offset == len(RoutingReplay.all_routing_replays)
+            assert routing_replay_offset == len(RoutingReplay.all_routing_replays), f"{routing_replay_offset} != {len(RoutingReplay.all_routing_replays)}"
 
         del rollout_data["rollout_routed_experts"]
 
